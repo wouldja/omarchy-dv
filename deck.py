@@ -33,6 +33,8 @@ TRANSPORTS = {
 # dvgrab must not send its own play/stop, or it fights the transport buttons.
 # The pipeline is its own session so closing the panel does not kill it.
 # tee --output-error=exit-nopipe keeps writing the file if the preview window closes.
+# A later stop must not trust the saved pid alone: the pid file also stores the
+# kernel start time, and signals go through pidfds only after that still matches.
 PIPELINE_SCRIPT = r"""
 set -o pipefail
 mute=()
@@ -206,32 +208,100 @@ def sane_timecode(text):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"
 
 
-def read_pid():
+PIPELINE_MARKER = "io.github.wouldja.dv"
+
+
+def read_pid_record():
+    parts = read_text(PID_PATH).split()
+    if not parts:
+        return 0, None
     try:
-        return int(read_text(PID_PATH))
+        pid = int(parts[0])
     except ValueError:
-        return 0
-
-
-def alive(pid):
-    if pid <= 0:
-        return False
+        return 0, None
+    if len(parts) < 2:
+        return pid, None
     try:
-        os.kill(pid, 0)
+        return pid, int(parts[1])
+    except ValueError:
+        return pid, None
+
+
+def write_pid_record(pid, starttime):
+    temporary = PID_PATH + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(f"{pid} {starttime}\n")
+    os.replace(temporary, PID_PATH)
+
+
+def process_stat(pid):
+    """Return ppid, pgrp, and starttime. starttime is the kernel boot tick."""
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+            raw = handle.read()
     except OSError:
-        return False
-    return True
+        return None
+    end = raw.rfind(")")
+    if end < 0:
+        return None
+    fields = raw[end + 2 :].split()
+    # After comm: state, ppid, pgrp, ..., starttime is field 22 (index 19).
+    if len(fields) < 20:
+        return None
+    try:
+        return {
+            "ppid": int(fields[1]),
+            "pgrp": int(fields[2]),
+            "starttime": int(fields[19]),
+        }
+    except ValueError:
+        return None
+
+
+def process_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+
+
+def pipeline_identity(pid, expected_start):
+    """The saved PID is ours only when it is still that process group leader.
+
+    A reused PID fails the start-time check. The command line must also be
+    this plugin's dvgrab pipeline, so a matching start time alone is not enough.
+    """
+    if pid <= 0:
+        return None
+    stat = process_stat(pid)
+    if not stat or stat["pgrp"] != pid:
+        return None
+    if expected_start is not None and stat["starttime"] != expected_start:
+        return None
+    command = process_cmdline(pid)
+    if PIPELINE_MARKER not in command or "dvgrab" not in command:
+        return None
+    return stat
+
+
+def clear_pid_record():
+    try:
+        os.remove(PID_PATH)
+    except OSError:
+        pass
 
 
 def pipeline_running():
-    pid = read_pid()
-    if alive(pid):
+    pid, starttime = read_pid_record()
+    ident = pipeline_identity(pid, starttime)
+    if ident:
+        if starttime is None:
+            write_pid_record(pid, ident["starttime"])
         return True
     if pid:
-        try:
-            os.remove(PID_PATH)
-        except OSError:
-            pass
+        clear_pid_record()
     return False
 
 
@@ -244,7 +314,7 @@ def recover_capture():
     """The tee process is the source of truth if the marker file was lost."""
     if capture_target() or not pipeline_running():
         return
-    pid = read_pid()
+    pid, _starttime = read_pid_record()
     try:
         listing = subprocess.check_output(
             ["ps", "-o", "args=", "--ppid", str(pid)],
@@ -407,8 +477,28 @@ def start_pipeline(preview, record_path="", append=False):
         start_new_session=True,
         close_fds=True,
     )
-    with open(PID_PATH, "w", encoding="utf-8") as handle:
-        handle.write(str(process.pid))
+    # Popen returns the child pid. Until exec, its command line can still be
+    # ours, so wait until this pid is the dvgrab shell. Never signal it unless
+    # it stayed our child for that whole wait: a reused pid has a new parent
+    # or a new start time, and killing it would hit whatever took the number.
+    born = None
+    ident = None
+    for _ in range(50):
+        stat = process_stat(process.pid)
+        if not stat or stat["ppid"] != os.getpid() or stat["pgrp"] != process.pid:
+            return "the preview process did not start"
+        if born is None:
+            born = stat["starttime"]
+        elif stat["starttime"] != born:
+            return "the preview process did not start"
+        ident = pipeline_identity(process.pid, born)
+        if ident:
+            break
+        time.sleep(0.01)
+    if not ident:
+        signal_started_group(process.pid, born, signal.SIGKILL)
+        return "the preview process did not start"
+    write_pid_record(process.pid, ident["starttime"])
     if record_path:
         with open(CAPTURE_PATH, "w", encoding="utf-8") as handle:
             handle.write(record_path)
@@ -420,36 +510,149 @@ def start_pipeline(preview, record_path="", append=False):
     return ""
 
 
+def process_children(pid):
+    path = f"/proc/{pid}/task/{pid}/children"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            parts = handle.read().split()
+    except OSError:
+        parts = None
+    if parts is None:
+        found = []
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return []
+        for name in names:
+            if not name.isdigit():
+                continue
+            stat = process_stat(int(name))
+            if stat and stat["ppid"] == pid:
+                found.append(int(name))
+        return found
+    children = []
+    for part in parts:
+        try:
+            children.append(int(part))
+        except ValueError:
+            continue
+    return children
+
+
+def open_verified_pidfd(pid, starttime, pgrp=None, ppid=None):
+    """A pidfd for pid, or None if that pid no longer has this start time.
+
+    The start time is read before and after the open. A pid reused in
+    between belongs to a different start time, so its fd is closed unused.
+    """
+
+    def matches(stat):
+        if not stat or stat["starttime"] != starttime:
+            return False
+        if pgrp is not None and stat["pgrp"] != pgrp:
+            return False
+        if ppid is not None and stat["ppid"] != ppid:
+            return False
+        return True
+
+    if not matches(process_stat(pid)):
+        return None
+    try:
+        pidfd = os.pidfd_open(pid)
+    except OSError:
+        return None
+    if not matches(process_stat(pid)):
+        os.close(pidfd)
+        return None
+    return pidfd
+
+
+def collect_descendants(leader, leader_start):
+    """Child processes still in this group, as (pid, starttime, ppid)."""
+    accepted = {leader: leader_start}
+    found = []
+    stack = [leader]
+    while stack:
+        current = stack.pop()
+        parent_start = accepted.get(current)
+        if parent_start is None:
+            continue
+        parent = process_stat(current)
+        if not parent or parent["starttime"] != parent_start:
+            continue
+        for child in process_children(current):
+            if child in accepted:
+                continue
+            stat = process_stat(child)
+            if not stat or stat["ppid"] != current or stat["pgrp"] != leader:
+                continue
+            accepted[child] = stat["starttime"]
+            found.append((child, stat["starttime"], current))
+            stack.append(child)
+    return found
+
+
+def signal_started_group(pid, starttime, sig):
+    """Signal the group leader and its descendants, or signal nothing.
+
+    Callers must already know this start time. Each pidfd is opened only
+    while that start time still matches, and the signal is sent to the fd.
+    """
+    leader_fd = open_verified_pidfd(pid, starttime, pgrp=pid)
+    if leader_fd is None:
+        return False
+    fds = [leader_fd]
+    try:
+        confirmed = process_stat(pid)
+        if not confirmed or confirmed["starttime"] != starttime or confirmed["pgrp"] != pid:
+            return False
+        for child, child_start, parent in collect_descendants(pid, starttime):
+            child_fd = open_verified_pidfd(child, child_start, pgrp=pid, ppid=parent)
+            if child_fd is not None:
+                fds.append(child_fd)
+        sent = False
+        for pidfd in fds:
+            try:
+                signal.pidfd_send_signal(pidfd, sig)
+                sent = True
+            except OSError:
+                continue
+        return sent
+    finally:
+        for pidfd in fds:
+            os.close(pidfd)
+
+
+def signal_pipeline(pid, starttime, sig):
+    ident = pipeline_identity(pid, starttime)
+    if not ident:
+        return False
+    return signal_started_group(pid, ident["starttime"], sig)
+
+
 def stop_pipeline():
-    pid = read_pid()
-    if alive(pid):
-        try:
-            os.killpg(pid, signal.SIGINT)
-        except OSError:
-            pass
-        for _ in range(40):
-            if not alive(pid):
-                break
-            time.sleep(0.05)
-        if alive(pid):
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except OSError:
-                pass
-        for _ in range(20):
-            if not alive(pid):
-                break
-            time.sleep(0.05)
-        if alive(pid):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except OSError:
-                pass
-    for path in (PID_PATH, SOCK_PATH):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    pid, starttime = read_pid_record()
+    ident = pipeline_identity(pid, starttime)
+    if ident:
+        started = ident["starttime"]
+        if signal_pipeline(pid, started, signal.SIGINT):
+            for _ in range(40):
+                if not pipeline_identity(pid, started):
+                    break
+                time.sleep(0.05)
+            if pipeline_identity(pid, started):
+                signal_pipeline(pid, started, signal.SIGTERM)
+            for _ in range(20):
+                if not pipeline_identity(pid, started):
+                    break
+                time.sleep(0.05)
+            if pipeline_identity(pid, started):
+                signal_pipeline(pid, started, signal.SIGKILL)
+    clear_pid_record()
+    try:
+        os.remove(SOCK_PATH)
+    except OSError:
+        pass
 
 
 def restart_pipeline(preview, record_path="", append=False):

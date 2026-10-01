@@ -168,7 +168,7 @@ Panel {
           width: parent.width
           title: "DV"
           iconSize: Style.font.title
-          detail: "1.2.0"
+          detail: "1.3.0"
           meta: Model.heroMeta({
             connected: root.connected,
             model: root.deckModel,
